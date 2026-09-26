@@ -367,13 +367,20 @@ livePane[spec_, ctx_, side_, r_, vpF_, vvF_, w_, vs_] := With[{g = ctx["Graphic"
 
 (* Axis-locked figure: a Grid (a Graphics of Insets captures the clicks, i19), label rows above pane rows. Linked pan and
    zoom always on (Q9); only the Free pane rotates (Q16). *)
-axisLockedFigure[input_, matrix_, opts_] := Module[{ctx = prepare[input, opts, False], ref, box, side, labels, nc = Length[First[matrix]], grid},
+(* Side of the square panes, and label rows (Style or "") with a flag for whether any label is shown. *)
+paneSide[matrix_, opts_] := With[{nc = Length[First[matrix]],
+    w = Replace[OptionValue[MultiviewGraphics3D, opts, ImageSize], {{x_, _} :> x, s_Symbol :> Lookup[$namedSizes, s, Automatic]}]},
+   If[NumericQ[w], (w - $gapPoints (nc - 1))/nc, $interactiveCell]];
+liveLabels[matrix_, opts_, vp_] := With[{labels = Map[If[# === None, None,
+        viewLabel[#, OptionValue[MultiviewGraphics3D, opts, "ViewLabels"], True, vp]] &, matrix, {2}]},
+   {Map[If[# === None, "", labelStyle[#, opts]] &, labels, {2}], ! AllTrue[Flatten[labels], # === None &]}];
+
+axisLockedFigure[input_, matrix_, opts_] := Module[{ctx = prepare[input, opts, False], ref, box, side, labels, grid},
    {ref, box} = storeRef[OptionValue[MultiviewGraphics3D, opts, PreserveImageOptions]];
-   side = With[{w = Replace[OptionValue[MultiviewGraphics3D, opts, ImageSize], {{x_, _} :> x, s_Symbol :> Lookup[$namedSizes, s, Automatic]}]},
-     If[NumericQ[w], (w - $gapPoints (nc - 1))/nc, $interactiveCell]];
-   labels = Map[If[# === None, None, viewLabel[#, OptionValue[MultiviewGraphics3D, opts, "ViewLabels"], True, ctx["ViewPoint"]]] &, matrix, {2}];
+   side = paneSide[matrix, opts];
+   labels = liveLabels[matrix, opts, ctx["ViewPoint"]];
    With[{r = ref, anchor = box, c = ctx, m = matrix, sd = side,
-     rows = Map[If[# === None, "", labelStyle[#, opts]] &, labels, {2}], hasLabels = ! AllTrue[Flatten[labels], # === None &],
+     rows = First[labels], hasLabels = Last[labels],
      vp0 = N[ctx["ViewPoint"]], vv0 = paneView[ctx["ViewPoint"]]["Vertical"], vs0 = ctx["Geometry"]["ViewSize0"],
      bg = figureOption[Background, input, opts]},
     grid = DynamicModule[{vpF = vp0, vvF = vv0, w = {0., 0., 0.}, vs = vs0},
@@ -397,6 +404,90 @@ paneStyle[opts_] := FilterRules[FilterRules[opts, Options[Graphics3D]],
    Except[$droppedOptions | $figureOptions | LabelStyle | Lighting]];
 
 (* ::Section:: *)
+(* Rig-locked figure *)
+
+(* Orthonormal camera frame {right, up, back}; back points from the centre towards the camera (display coordinates). *)
+rigFrame[d_, u_] := With[{back = Normalize[d]}, With[{right = Normalize[Cross[u, back]]}, {right, Cross[back, right], back}]];
+
+(* The rig rotation taking a pane's base camera {d0, u0} to camera {d, u}: F^T . F0. A degenerate camera (d along u)
+   keeps r. Round trip exact to 1e-12 (p6). *)
+rigFromCamera[r_, {d0_, u0_}, {d_, u_}] :=
+  If[Norm[Cross[d, u]] < 10^-6 Norm[d] Norm[u], r, Transpose[rigFrame[d, u]] . rigFrame[d0, u0]];
+
+SetAttributes[{setRig, setRigViewPoint, setRigVertical}, HoldFirst];
+setRig[r_, ref_, m_] := If[MatrixQ[m, NumericQ] && Dimensions[m] == {3, 3} &&
+    ! (MatrixQ[r, NumericQ] && Max[Abs[m - r]] <= $tolerance), r = m; storePut[ref, "Rig", m]];
+
+(* Both ViewPoint and ViewVertical drive the rig: the front end writes both on rotation, and linking only ViewPoint
+   leaves the roll unlinked (i13). base = {d0, u0} in display coordinates; ViewVertical is in scaled coordinates. *)
+setRigViewPoint[r_, ref_, base_, vp_] := With[{m = If[MatrixQ[r, NumericQ], r, IdentityMatrix[3]]},
+   If[VectorQ[vp, NumericQ], setRig[r, ref, rigFromCamera[m, base, {vp, m . base[[2]]}]]]];
+setRigVertical[r_, ref_, base_, br_, vv_] := With[{m = If[MatrixQ[r, NumericQ], r, IdentityMatrix[3]]},
+   If[VectorQ[vv, NumericQ], setRig[r, ref, rigFromCamera[m, base, {m . base[[1]], Normalize[vv br]}]]]];
+
+(* Rig lighting: camera-frame lights fixed as they fall in the reference view, then turned with r. Returned as parts so
+   the Dynamic can rebuild the lights with System functions only: {fixed lights, colours, display directions}. *)
+rigLightParts[lights_, ref_, geo_] := {
+   paneLighting["Object", DeleteCases[lights, {"Directional", _, ImageScaled[_]}], ref, geo],
+   Cases[lights, {"Directional", col_, ImageScaled[_]} :> col],
+   Cases[lights, {"Directional", _, ImageScaled[p_]} :> cameraToDisplay[p, ref, geo]]};
+
+(* Options of one live pane in rig-locked mode. r, w, vs are DynamicModule variables (held). *)
+SetAttributes[rigPaneOptions, HoldRest];
+rigPaneOptions[spec_, ctx_, ref_, r_, w_, vs_] := With[{geo = ctx["Geometry"], free = spec === "Free"},
+  With[{br = geo["BoxRatios"], k = geo["K"], vs0 = geo["ViewSize0"], v = paneView[If[free, ctx["ViewPoint"], spec]],
+    proj = If[free, ctx["ViewProjection"], "Orthographic"],
+    dist = If[free && ctx["ViewProjection"] =!= "Orthographic", Norm[N[ctx["ViewPoint"]]], $viewDistance]},
+   With[{d0 = v["Direction"], u0 = Normalize[v["Vertical"] br], a0 = 2 ArcTan[vs0/(2 k dist)]},
+    With[{rt0 = screenFrame[d0, u0][[1]], up0 = screenFrame[d0, u0][[2]]},
+     Flatten[{
+       ViewPoint -> Dynamic[dist Normalize[If[MatrixQ[r, NumericQ], r, IdentityMatrix[3]] . d0],
+         setRigViewPoint[r, ref, {d0, u0}, #] &],
+       ViewVertical -> Dynamic[(If[MatrixQ[r, NumericQ], r, IdentityMatrix[3]] . u0)/br,
+         setRigVertical[r, ref, {d0, u0}, br, #] &],
+       ViewCenter -> Dynamic[
+         With[{m = If[MatrixQ[r, NumericQ], r, IdentityMatrix[3]]},
+          {{1, 1, 1}/2, {1, 1}/2 + {m . rt0, m . up0} . If[VectorQ[w, NumericQ], w, {0, 0, 0}]}],
+         setPan[w, With[{m = If[MatrixQ[r, NumericQ], r, IdentityMatrix[3]]}, {m . rt0, m . up0}], ref, #] &],
+       If[proj === "Orthographic",
+        "ViewSize" -> Dynamic[If[NumericQ[vs], vs, vs0], setZoom[vs, ref, #] &],
+        ViewAngle -> Dynamic[If[NumericQ[vs], 2 ArcTan[vs/(2 k dist)], a0], setAngle[vs, k, dist, ref, #] &]],
+       ViewProjection -> proj,
+       If[ctx["Attachment"] === "Rig",
+        With[{parts = rigLightParts[ctx["Lights"], ctx["Reference"], geo], c = geo["Center"], s = geo["Scale"]},
+         With[{fixed = parts[[1]], cols = parts[[2]], dirs = parts[[3]]},
+          Lighting -> Dynamic[With[{m = If[MatrixQ[r, NumericQ], r, IdentityMatrix[3]]},
+             Join[fixed, MapThread[DirectionalLight[#1, {c + (m . #2)/s, c}] &, {cols, dirs}]]]]]],
+        Lighting -> paneLighting[ctx["Attachment"], ctx["Lights"], ctx["Reference"], geo]]}]]]]];
+
+SetAttributes[rigPane, HoldRest];
+rigPane[spec_, ctx_, side_, ref_, r_, w_, vs_] := With[{g = ctx["Graphic"], geo = ctx["Geometry"]},
+   Graphics3D[First[g],
+    Sequence @@ rigPaneOptions[spec, ctx, ref, r, w, vs],
+    SphericalRegion -> True, PlotRange -> geo["PlotRange"], PlotRangePadding -> None, Background -> None, ImageSize -> side,
+    Sequence @@ ctx["Style"],
+    Sequence @@ FilterRules[Options[g], Except[Lighting | PlotRange | PlotRangePadding]]]];
+
+(* Rig-locked figure: every pane turns with one rig rotation (a glass box); pan and zoom linked. *)
+rigLockedFigure[input_, matrix_, opts_] := Module[{ctx = prepare[input, opts, True], ref, box, grid},
+   {ref, box} = storeRef[OptionValue[MultiviewGraphics3D, opts, PreserveImageOptions]];
+   With[{rf = ref, anchor = box, c = ctx, m = matrix, sd = paneSide[matrix, opts], labels = liveLabels[matrix, opts, ctx["ViewPoint"]],
+     vs0 = ctx["Geometry"]["ViewSize0"], bg = figureOption[Background, input, opts], id = N[IdentityMatrix[3]]},
+    grid = DynamicModule[{r = id, w = {0., 0., 0.}, vs = vs0},
+      Grid[
+       Flatten[MapThread[
+         Function[{labelRow, specRow},
+          {If[Last[labels], labelRow, Nothing], Map[If[# === None, Spacer[sd], rigPane[#, c, sd, rf, r, w, vs]] &, specRow]}],
+         {First[labels], m}], 1],
+       Spacings -> {1, 0.4}, Background -> bg],
+      Initialization :> (
+        If[anchor =!= None, $storeOrdinal[anchor] = 0];
+        r = storeGet[rf, "Rig", MatrixQ[#, NumericQ] && Dimensions[#] == {3, 3} &, id];
+        w = storeGet[rf, "Pan", VectorQ[#, NumericQ] &, {0., 0., 0.}];
+        vs = storeGet[rf, "Zoom", NumericQ, vs0])]];
+   rewrap[With[{pl = figureOption[PlotLabel, input, opts]}, If[pl === None, grid, Labeled[grid, pl, Top]]], input]];
+
+(* ::Section:: *)
 (* Top level *)
 
 issueFailure[f_Failure] := (Cases[Normal[f[[2]]], HoldPattern["MessageTemplate" :> m_] :> Message[m, Sequence @@ f[[2]]["MessageParameters"]]]; $Failed);
@@ -409,7 +500,7 @@ MultiviewGraphics3D[g_, layout : Except[_Rule | _RuleDelayed], opts : OptionsPat
     FailureQ[input], issueFailure[input],
     FailureQ[matrix], issueFailure[matrix],
     OptionValue[MultiviewGraphics3D, {opts}, "CameraInteraction"] === None, staticFigure[input, matrix, {opts}],
-    (* rig-locked is not built yet: axis-locked for now *)
+    OptionValue[MultiviewGraphics3D, {opts}, "CameraInteraction"] === "RigLocked", rigLockedFigure[input, matrix, {opts}],
     True, axisLockedFigure[input, matrix, {opts}]]];
 
 End[];
