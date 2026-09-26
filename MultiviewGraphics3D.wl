@@ -146,9 +146,11 @@ cellSizes[sizes_] := With[{wh = Replace[sizes, None -> {0, 0}, {2}]},
 (* Lighting *)
 
 (* Plot3D & co. bake camera lighting into the surface style, which overrides the Lighting option (FINDINGS round 2).
-   Shim: delete the inner Lighting rules and return the first inner light list (the plot's own tinted lights), or None. *)
+   Shim: delete the inner Lighting rules and return the first inner light list (the plot's own tinted lights), or None.
+   ReplaceAll, not DeleteCases at every level: DeleteCases rebuilds the whole primitive tree, and ToBoxes of the result
+   was 50 times slower (p45, p46). *)
 stripInnerLighting[g_Graphics3D] := With[{inner = Cases[First[g], HoldPattern[Lighting -> l_List] :> l, Infinity]},
-   {Graphics3D[DeleteCases[First[g], HoldPattern[Lighting -> _], Infinity], Sequence @@ Options[g]],
+   {Graphics3D[First[g] /. HoldPattern[Lighting -> _List] :> Sequence[], Sequence @@ Options[g]],
     If[inner === {}, None, First[inner]]}];
 
 (* Named lighting (Automatic, "Neutral", ...) as a list of light specs. Needs the front end. *)
@@ -226,13 +228,20 @@ staticPane[g_, spec_, size_, ctx_] := Module[{geo = ctx["Geometry"], free = spec
      Sequence @@ ctx["Style"],
      Sequence @@ FilterRules[Options[g], Except[Lighting | PlotRange | PlotRangePadding | PlotInteractivity]]]];
 
-staticFigure[input_, matrix_, opts_] := Module[{g, inner, geo, att, lights, vp, sizes, ppu, labels, strip, place, figure},
+(* What both the static and the interactive figure need. The rig never moves in static or axis-locked output, so
+   "Rig" lighting is "Object" lighting there. *)
+prepare[input_, opts_, rigMoves_] := Module[{g, inner, att, vp},
    {g, inner} = stripInnerLighting[input["Graphic"]];
-   geo = graphicGeometry[g];
    vp = OptionValue[MultiviewGraphics3D, opts, ViewPoint];
-   att = Replace[OptionValue[MultiviewGraphics3D, opts, "LightingAttachment"], {Automatic -> "Camera", "Rig" -> "Object"}];
-   lights = Which[inner =!= None, inner, att === "Camera", OptionValue[Graphics3D, Options[g], Lighting],
-     True, resolveLighting[OptionValue[Graphics3D, Options[g], Lighting]]];
+   att = Replace[OptionValue[MultiviewGraphics3D, opts, "LightingAttachment"],
+     {Automatic -> If[rigMoves, "Rig", "Camera"], "Rig" /; ! rigMoves -> "Object"}];
+   <|"Graphic" -> g, "Geometry" -> graphicGeometry[g], "Attachment" -> att, "ViewPoint" -> vp, "Reference" -> paneView[vp],
+    "ViewProjection" -> OptionValue[MultiviewGraphics3D, opts, ViewProjection], "Style" -> paneStyle[opts],
+    "Lights" -> Which[inner =!= None, inner, att === "Camera", OptionValue[Graphics3D, Options[g], Lighting],
+      True, resolveLighting[OptionValue[Graphics3D, Options[g], Lighting]]]|>];
+
+staticFigure[input_, matrix_, opts_] := Module[{ctx = prepare[input, opts, False], g, geo, vp, sizes, ppu, labels, strip, place, figure},
+   g = ctx["Graphic"]; geo = ctx["Geometry"]; vp = ctx["ViewPoint"];
    sizes = Map[If[# === None, None, paneSize[geo, # /. "Free" -> vp]] &, matrix, {2}];
    ppu = pointsPerUnit[OptionValue[MultiviewGraphics3D, opts, ImageSize],
      Total[cellSizes[sizes]["ColumnWidths"]], Length[First[matrix]]];
@@ -243,17 +252,145 @@ staticFigure[input_, matrix_, opts_] := Module[{g, inner, geo, att, lights, vp, 
      MapThread[
       Function[{spec, size, label, center, lpos},
        If[spec === None, {},
-        {Inset[staticPane[g, spec, size,
-           <|"Geometry" -> geo, "Lights" -> lights, "Attachment" -> att, "Reference" -> paneView[vp], "ViewPoint" -> vp,
-            "ViewProjection" -> OptionValue[MultiviewGraphics3D, opts, ViewProjection],
-            "Style" -> paneStyle[opts]|>], center, Center, ppu size],
-         If[label === None, {}, Text[Style[label, Sequence @@ Flatten[{OptionValue[MultiviewGraphics3D, opts, LabelStyle]}]], lpos]]}]],
+        {Inset[staticPane[g, spec, size, ctx], center, Center, ppu size],
+         If[label === None, {}, Text[labelStyle[label, opts], lpos]]}]],
       {matrix, sizes, labels, place["Centers"], place["LabelPositions"]}, 2],
      PlotRange -> Transpose[{{0, 0}, place["Size"]}], PlotRangePadding -> None, ImagePadding -> 2,
      ImageSize -> First[place["Size"]] + 4,
-     PlotLabel -> Replace[OptionValue[Graphics3D, FilterRules[opts, Options[Graphics3D]], PlotLabel], None -> input["PlotLabel"]],
-     Background -> Replace[OptionValue[Graphics3D, FilterRules[opts, Options[Graphics3D]], Background], None -> input["Background"]]];
-   Fold[#2[[1]][#1, Sequence @@ #2[[2]]] &, figure, Reverse[input["Wrappers"]]]];
+     PlotLabel -> figureOption[PlotLabel, input, opts], Background -> figureOption[Background, input, opts]];
+   rewrap[figure, input]];
+
+labelStyle[label_, opts_] := Style[label, Sequence @@ Flatten[{OptionValue[MultiviewGraphics3D, opts, LabelStyle]}]];
+
+(* PlotLabel and Background passed to the function win over the input's. *)
+figureOption[o_, input_, opts_] := Replace[OptionValue[Graphics3D, FilterRules[opts, Options[Graphics3D]], o],
+   None -> input[SymbolName[o]]];
+
+(* Reapply the input's wrappers once, innermost first. *)
+rewrap[figure_, input_] := Fold[#2[[1]][#1, Sequence @@ #2[[2]]] &, figure, Reverse[input["Wrappers"]]];
+
+(* ::Section:: *)
+(* Camera store *)
+
+(* Keeps the explored camera when a surrounding Dynamic or Manipulate rebuilds the output (design-decisions, "Keeping
+   the camera across rebuilds"). The store is in the TaggingRules of the evaluation cell, keyed per call by
+   {Hash[EvaluationBox[]], ordinal}. At top level EvaluationBox[] is $Failed: local state only, so evaluating again
+   resets the view (Q21). *)
+$storeOrdinal[_] = 0;
+anchorBox[] := If[$FrontEnd === Null, $Failed, EvaluationBox[]];
+storeCell[] := EvaluationCell[];
+
+(* {store reference or None, anchor}. The ordinal counter is global state changed during a build, so it is hidden
+   from a surrounding Dynamic with Refresh[..., None] (i17 mM). *)
+storeRef[preserve_] := With[{box = If[preserve === False, $Failed, anchorBox[]]},
+   If[box === $Failed, {None, None},
+    With[{k = Refresh[++$storeOrdinal[box], None]},
+     {{storeCell[], {TaggingRules, "MultiviewGraphics3D", ToString[{Hash[box], k}]}}, box}]]];
+
+storeGet[None, _, _, default_] := default;
+storeGet[{obj_, path_}, key_, test_, default_] := With[{v = CurrentValue[obj, Append[path, key]]}, If[test[v], v, default]];
+
+(* Only the cell that owns the store writes to it: a Copy Graphic paste must not (i18 mN). *)
+storePut[None, _, _] := Null;
+storePut[{obj_, path_}, key_, v_] := If[EvaluationCell[] === obj, CurrentValue[obj, Append[path, key]] = v];
+
+(* ::Section:: *)
+(* Setters *)
+
+(* The front end writes every camera option back on every frame, also unchanged ones, and only to about 1e-16 (i2).
+   Setters ignore changes below the tolerance, so an unchanged write-back neither updates the other panes nor the store. *)
+$tolerance = 10^-9;
+$panPattern = {{_?NumericQ, _?NumericQ, _?NumericQ}, {_?NumericQ, _?NumericQ}};
+
+SetAttributes[{setVector, setPan, setZoom, setAngle}, HoldFirst];
+setVector[x_, r_, key_, v_] := If[VectorQ[v, NumericQ] && ! (VectorQ[x, NumericQ] && Max[Abs[v - x]] <= $tolerance),
+   x = v; storePut[r, key, v]];
+
+(* A pan writes the screen part of ViewCenter as an image fraction (p11). All panes share one offset w (display frame,
+   image widths); a pan moves w within the panning pane's view plane, frame f = {right, up}. *)
+setPan[w_, f_, r_, v_] := If[MatchQ[v, $panPattern],
+   With[{w0 = If[VectorQ[w, NumericQ], w, {0, 0, 0}]}, With[{wn = w0 + (v[[2]] - {1, 1}/2 - f . w0) . f},
+     If[Max[Abs[wn - w0]] > $tolerance, w = wn; storePut[r, "Pan", wn]]]]];
+
+(* Orthographic zoom is "ViewSize" = k W (FINDINGS round 10). *)
+setZoom[vs_, r_, v_] := If[NumericQ[v] && ! (NumericQ[vs] && Abs[v - vs] <= $tolerance), vs = v; storePut[r, "Zoom", v]];
+
+(* Perspective zoom writes ViewAngle = 2 ArcTan[W / (2 |vp|)] (p18), with W = vs / k. *)
+setAngle[vs_, k_, d_, r_, a_] := If[NumericQ[a] && NumericQ[d], setZoom[vs, r, 2 k d Tan[a/2]]];
+
+(* ::Section:: *)
+(* Interactive figure *)
+
+freeFrame[vp_, vv_, br_] := screenFrame[Normalize[vp], Normalize[vv br]];
+
+$interactiveCell = 220;   (* points per pane when ImageSize is Automatic *)
+
+(* Options of one live pane in axis-locked mode. vpF, vvF, w, vs are DynamicModule variables (held). Every Dynamic has an
+   inline fallback made only of System functions (p32): on a rebuild, and in a pasted copy, the variables can be unbound. *)
+SetAttributes[livePaneOptions, HoldRest];
+livePaneOptions[spec_, ctx_, r_, vpF_, vvF_, w_, vs_] := With[{geo = ctx["Geometry"]},
+  With[{br = geo["BoxRatios"], k = geo["K"], vs0 = geo["ViewSize0"],
+    method = FilterRules[Flatten[{OptionValue[Graphics3D, Options[ctx["Graphic"]], Method]} /. Automatic -> {}],
+      Except["RotationControl"]]},
+   If[spec === "Free",
+    With[{vp0 = N[ctx["ViewPoint"]], vv0 = paneView[ctx["ViewPoint"]]["Vertical"], proj = ctx["ViewProjection"],
+      f0 = freeFrame[ctx["ViewPoint"], paneView[ctx["ViewPoint"]]["Vertical"], br], a0 = 2 ArcTan[vs0/(2 k Norm[ctx["ViewPoint"]])]},
+     Flatten[{
+       ViewPoint -> Dynamic[If[VectorQ[vpF, NumericQ], vpF, vp0], setVector[vpF, r, "ViewPoint", #] &],
+       ViewVertical -> Dynamic[If[VectorQ[vvF, NumericQ], vvF, vv0], setVector[vvF, r, "ViewVertical", #] &],
+       ViewCenter -> Dynamic[
+         With[{f = If[VectorQ[vpF, NumericQ] && VectorQ[vvF, NumericQ],
+             With[{d = Normalize[vpF]}, With[{rt = Normalize[Cross[Normalize[vvF br], d]]}, {rt, Cross[d, rt]}]], f0]},
+          {{1, 1, 1}/2, {1, 1}/2 + f . If[VectorQ[w, NumericQ], w, {0, 0, 0}]}],
+         setPan[w, freeFrame[vpF, vvF, br], r, #] &],
+       If[proj === "Orthographic",
+        "ViewSize" -> Dynamic[If[NumericQ[vs], vs, vs0], setZoom[vs, r, #] &],
+        ViewAngle -> Dynamic[If[NumericQ[vs] && VectorQ[vpF, NumericQ], 2 ArcTan[vs/(2 k Norm[vpF])], a0],
+          setAngle[vs, k, Norm[vpF], r, #] &]],
+       ViewProjection -> proj, If[method === {}, {}, Method -> method]}]],
+    With[{v = paneView[spec]},
+     With[{f = screenFrame[v["Direction"], Normalize[v["Vertical"] br]]},
+      {ViewPoint -> $viewDistance v["Direction"], ViewVertical -> v["Vertical"],
+       ViewCenter -> Dynamic[{{1, 1, 1}/2, {1, 1}/2 + f . If[VectorQ[w, NumericQ], w, {0, 0, 0}]}, setPan[w, f, r, #] &],
+       "ViewSize" -> Dynamic[If[NumericQ[vs], vs, vs0], setZoom[vs, r, #] &],
+       ViewProjection -> "Orthographic", Method -> Prepend[method, "RotationControl" -> None]}]]]]];
+
+SetAttributes[livePane, HoldRest];
+livePane[spec_, ctx_, side_, r_, vpF_, vvF_, w_, vs_] := With[{g = ctx["Graphic"], geo = ctx["Geometry"]},
+   Graphics3D[First[g],
+    Sequence @@ livePaneOptions[spec, ctx, r, vpF, vvF, w, vs],
+    SphericalRegion -> True, PlotRange -> geo["PlotRange"], PlotRangePadding -> None,
+    Lighting -> paneLighting[ctx["Attachment"], ctx["Lights"], ctx["Reference"], geo],
+    Background -> None, ImageSize -> side,
+    Sequence @@ ctx["Style"],
+    Sequence @@ FilterRules[Options[g], Except[Lighting | PlotRange | PlotRangePadding | Method]]]];
+
+(* Axis-locked figure: a Grid (a Graphics of Insets captures the clicks, i19), label rows above pane rows. Linked pan and
+   zoom always on (Q9); only the Free pane rotates (Q16). *)
+axisLockedFigure[input_, matrix_, opts_] := Module[{ctx = prepare[input, opts, False], ref, box, side, labels, nc = Length[First[matrix]], grid},
+   {ref, box} = storeRef[OptionValue[MultiviewGraphics3D, opts, PreserveImageOptions]];
+   side = With[{w = Replace[OptionValue[MultiviewGraphics3D, opts, ImageSize], {{x_, _} :> x, s_Symbol :> Lookup[$namedSizes, s, Automatic]}]},
+     If[NumericQ[w], (w - $gapPoints (nc - 1))/nc, $interactiveCell]];
+   labels = Map[If[# === None, None, viewLabel[#, OptionValue[MultiviewGraphics3D, opts, "ViewLabels"], True, ctx["ViewPoint"]]] &, matrix, {2}];
+   With[{r = ref, anchor = box, c = ctx, m = matrix, sd = side,
+     rows = Map[If[# === None, "", labelStyle[#, opts]] &, labels, {2}], hasLabels = ! AllTrue[Flatten[labels], # === None &],
+     vp0 = N[ctx["ViewPoint"]], vv0 = paneView[ctx["ViewPoint"]]["Vertical"], vs0 = ctx["Geometry"]["ViewSize0"],
+     bg = figureOption[Background, input, opts]},
+    grid = DynamicModule[{vpF = vp0, vvF = vv0, w = {0., 0., 0.}, vs = vs0},
+      Grid[
+       Flatten[MapThread[
+         Function[{labelRow, specRow},
+          {If[hasLabels, labelRow, Nothing],
+           Map[If[# === None, Spacer[sd], livePane[#, c, sd, r, vpF, vvF, w, vs]] &, specRow]}],
+         {rows, m}], 1],
+       Spacings -> {1, 0.4}, Background -> bg],
+      Initialization :> (
+        If[anchor =!= None, $storeOrdinal[anchor] = 0];
+        vpF = storeGet[r, "ViewPoint", VectorQ[#, NumericQ] &, vp0];
+        vvF = storeGet[r, "ViewVertical", VectorQ[#, NumericQ] &, vv0];
+        w = storeGet[r, "Pan", VectorQ[#, NumericQ] &, {0., 0., 0.}];
+        vs = storeGet[r, "Zoom", NumericQ, vs0])]];
+   rewrap[With[{pl = figureOption[PlotLabel, input, opts]}, If[pl === None, grid, Labeled[grid, pl, Top]]], input]];
 
 (* Graphics3D style options passed to the function apply to every pane (Q23); camera, framing and figure options do not. *)
 paneStyle[opts_] := FilterRules[FilterRules[opts, Options[Graphics3D]],
@@ -271,8 +408,9 @@ MultiviewGraphics3D[g_, layout : Except[_Rule | _RuleDelayed], opts : OptionsPat
    Which[
     FailureQ[input], issueFailure[input],
     FailureQ[matrix], issueFailure[matrix],
-    (* interactive modes are not built yet: static for now *)
-    True, staticFigure[input, matrix, {opts}]]];
+    OptionValue[MultiviewGraphics3D, {opts}, "CameraInteraction"] === None, staticFigure[input, matrix, {opts}],
+    (* rig-locked is not built yet: axis-locked for now *)
+    True, axisLockedFigure[input, matrix, {opts}]]];
 
 End[];
 EndPackage[];

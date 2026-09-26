@@ -18,6 +18,11 @@ VerificationTest[
 
 VerificationTest[stripInnerLighting[Graphics3D[Cuboid[]]], {Graphics3D[Cuboid[]], None}, TestID -> "No-inner"]
 
+(* Stripping must not rebuild the primitives: the boxes of a stripped Plot3D stay the same size (p45: 4.4 times larger). *)
+VerificationTest[
+ With[{p = Plot3D[x y, {x, 0, 1}, {y, 0, 1}, Mesh -> 5]}, ByteCount[ToBoxes[First[stripInnerLighting[p]]]] < 1.1 ByteCount[ToBoxes[p]]],
+ True, TestID -> "Strip-keeps-structure"]
+
 (* ---- camera frame -> display frame, for a view ---- *)
 
 (* In Front: towards the viewer = -y, screen right = +x, screen up = +z. *)
