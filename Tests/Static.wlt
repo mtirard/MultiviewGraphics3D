@@ -69,4 +69,10 @@ VerificationTest[
  MultiviewGraphics3D[box, {{"Free", "Free"}}, "CameraInteraction" -> None], $Failed,
  {MultiviewGraphics3D::free}, TestID -> "Bad-layout-message"]
 
+(* Graphics3D style options passed to the function reach every pane, over the input's own, with no messages (Q23, issue 1). *)
+VerificationTest[
+ Union[Cases[MultiviewGraphics3D[box, "ThreeView", Boxed -> True, Axes -> True, "CameraInteraction" -> None],
+   Graphics3D[_, o___] :> Lookup[{o}, {Boxed, Axes}], Infinity]],
+ {{True, True}}, TestID -> "Style-options-every-pane"]
+
 EndTestSection[]

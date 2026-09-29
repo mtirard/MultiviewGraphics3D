@@ -93,4 +93,9 @@ VerificationTest[
  With[{f = MultiviewGraphics3D[Legended[Graphics3D[Cuboid[], PlotLabel -> "T"], "leg"]]}, {Head[f], Head[First[f]], Head[First[First[f]]]}],
  {Legended, Labeled, DynamicModule}, TestID -> "Wrappers-and-title"]
 
+(* Graphics3D style options passed to the function reach every pane, over the input's own, with no messages (Q23, issue 1). *)
+VerificationTest[
+ Union[Lookup[Options[#], {Boxed, Axes}] & /@ panes[MultiviewGraphics3D[box, "ThreeView", Boxed -> True, Axes -> True]]],
+ {{True, True}}, TestID -> "Style-options-every-pane"]
+
 EndTestSection[]

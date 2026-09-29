@@ -87,4 +87,10 @@ VerificationTest[
   MemberQ[MultiviewGraphics3D[box, "CameraInteraction" -> "RigLocked"], "Rig", Infinity]],
  True, TestID -> "Store-has-rig"]
 
+(* Graphics3D style options passed to the function reach every pane, over the input's own, with no messages (Q23, issue 1). *)
+VerificationTest[
+ Union[Lookup[Options[#], {Boxed, Axes}] & /@
+   panes[MultiviewGraphics3D[box, "ThreeView", Boxed -> True, Axes -> True, "CameraInteraction" -> "RigLocked"]]],
+ {{True, True}}, TestID -> "Style-options-every-pane"]
+
 EndTestSection[]

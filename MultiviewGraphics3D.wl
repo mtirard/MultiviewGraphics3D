@@ -17,6 +17,10 @@ Options[MultiviewGraphics3D] = {
 
 Begin["`Private`"];
 
+(* The function's own option. opts also holds Graphics3D options, which OptionValue[MultiviewGraphics3D, ...] would
+   report with ::nodef. *)
+ownOption[opts_, name_] := OptionValue[MultiviewGraphics3D, FilterRules[opts, Options[MultiviewGraphics3D]], name];
+
 (* ::Section:: *)
 (* Layouts *)
 
@@ -232,20 +236,20 @@ staticPane[g_, spec_, size_, ctx_] := Module[{geo = ctx["Geometry"], free = spec
    "Rig" lighting is "Object" lighting there. *)
 prepare[input_, opts_, rigMoves_] := Module[{g, inner, att, vp},
    {g, inner} = stripInnerLighting[input["Graphic"]];
-   vp = OptionValue[MultiviewGraphics3D, opts, ViewPoint];
-   att = Replace[OptionValue[MultiviewGraphics3D, opts, "LightingAttachment"],
+   vp = ownOption[opts, ViewPoint];
+   att = Replace[ownOption[opts, "LightingAttachment"],
      {Automatic -> If[rigMoves, "Rig", "Camera"], "Rig" /; ! rigMoves -> "Object"}];
    <|"Graphic" -> g, "Geometry" -> graphicGeometry[g], "Attachment" -> att, "ViewPoint" -> vp, "Reference" -> paneView[vp],
-    "ViewProjection" -> OptionValue[MultiviewGraphics3D, opts, ViewProjection], "Style" -> paneStyle[opts],
+    "ViewProjection" -> ownOption[opts, ViewProjection], "Style" -> paneStyle[opts],
     "Lights" -> Which[inner =!= None, inner, att === "Camera", OptionValue[Graphics3D, Options[g], Lighting],
       True, resolveLighting[OptionValue[Graphics3D, Options[g], Lighting]]]|>];
 
 staticFigure[input_, matrix_, opts_] := Module[{ctx = prepare[input, opts, False], g, geo, vp, sizes, ppu, labels, strip, place, figure},
    g = ctx["Graphic"]; geo = ctx["Geometry"]; vp = ctx["ViewPoint"];
    sizes = Map[If[# === None, None, paneSize[geo, # /. "Free" -> vp]] &, matrix, {2}];
-   ppu = pointsPerUnit[OptionValue[MultiviewGraphics3D, opts, ImageSize],
+   ppu = pointsPerUnit[ownOption[opts, ImageSize],
      Total[cellSizes[sizes]["ColumnWidths"]], Length[First[matrix]]];
-   labels = Map[If[# === None, None, viewLabel[#, OptionValue[MultiviewGraphics3D, opts, "ViewLabels"], False, vp]] &, matrix, {2}];
+   labels = Map[If[# === None, None, viewLabel[#, ownOption[opts, "ViewLabels"], False, vp]] &, matrix, {2}];
    strip = If[AllTrue[Flatten[labels], # === None &], 0, $labelPoints];
    place = cellPlacement[cellSizes[Map[If[# === None, None, ppu #] &, sizes, {2}]], $gapPoints, strip];
    figure = Graphics[
@@ -260,7 +264,7 @@ staticFigure[input_, matrix_, opts_] := Module[{ctx = prepare[input, opts, False
      PlotLabel -> figureOption[PlotLabel, input, opts], Background -> figureOption[Background, input, opts]];
    rewrap[figure, input]];
 
-labelStyle[label_, opts_] := Style[label, Sequence @@ Flatten[{OptionValue[MultiviewGraphics3D, opts, LabelStyle]}]];
+labelStyle[label_, opts_] := Style[label, Sequence @@ Flatten[{ownOption[opts, LabelStyle]}]];
 
 (* PlotLabel and Background passed to the function win over the input's. *)
 figureOption[o_, input_, opts_] := Replace[OptionValue[Graphics3D, FilterRules[opts, Options[Graphics3D]], o],
@@ -369,14 +373,14 @@ livePane[spec_, ctx_, side_, r_, vpF_, vvF_, w_, vs_] := With[{g = ctx["Graphic"
    zoom always on (Q9); only the Free pane rotates (Q16). *)
 (* Side of the square panes, and label rows (Style or "") with a flag for whether any label is shown. *)
 paneSide[matrix_, opts_] := With[{nc = Length[First[matrix]],
-    w = Replace[OptionValue[MultiviewGraphics3D, opts, ImageSize], {{x_, _} :> x, s_Symbol :> Lookup[$namedSizes, s, Automatic]}]},
+    w = Replace[ownOption[opts, ImageSize], {{x_, _} :> x, s_Symbol :> Lookup[$namedSizes, s, Automatic]}]},
    If[NumericQ[w], (w - $gapPoints (nc - 1))/nc, $interactiveCell]];
 liveLabels[matrix_, opts_, vp_] := With[{labels = Map[If[# === None, None,
-        viewLabel[#, OptionValue[MultiviewGraphics3D, opts, "ViewLabels"], True, vp]] &, matrix, {2}]},
+        viewLabel[#, ownOption[opts, "ViewLabels"], True, vp]] &, matrix, {2}]},
    {Map[If[# === None, "", labelStyle[#, opts]] &, labels, {2}], ! AllTrue[Flatten[labels], # === None &]}];
 
 axisLockedFigure[input_, matrix_, opts_] := Module[{ctx = prepare[input, opts, False], ref, box, side, labels, grid},
-   {ref, box} = storeRef[OptionValue[MultiviewGraphics3D, opts, PreserveImageOptions]];
+   {ref, box} = storeRef[ownOption[opts, PreserveImageOptions]];
    side = paneSide[matrix, opts];
    labels = liveLabels[matrix, opts, ctx["ViewPoint"]];
    With[{r = ref, anchor = box, c = ctx, m = matrix, sd = side,
@@ -470,7 +474,7 @@ rigPane[spec_, ctx_, side_, ref_, r_, w_, vs_] := With[{g = ctx["Graphic"], geo 
 
 (* Rig-locked figure: every pane turns with one rig rotation (a glass box); pan and zoom linked. *)
 rigLockedFigure[input_, matrix_, opts_] := Module[{ctx = prepare[input, opts, True], ref, box, grid},
-   {ref, box} = storeRef[OptionValue[MultiviewGraphics3D, opts, PreserveImageOptions]];
+   {ref, box} = storeRef[ownOption[opts, PreserveImageOptions]];
    With[{rf = ref, anchor = box, c = ctx, m = matrix, sd = paneSide[matrix, opts], labels = liveLabels[matrix, opts, ctx["ViewPoint"]],
      vs0 = ctx["Geometry"]["ViewSize0"], bg = figureOption[Background, input, opts], id = N[IdentityMatrix[3]]},
     grid = DynamicModule[{r = id, w = {0., 0., 0.}, vs = vs0},
@@ -495,12 +499,12 @@ issueFailure[f_Failure] := (Cases[Normal[f[[2]]], HoldPattern["MessageTemplate" 
 MultiviewGraphics3D[g_, opts : OptionsPattern[{MultiviewGraphics3D, Graphics3D}]] := MultiviewGraphics3D[g, "QuadView", opts];
 MultiviewGraphics3D[g_, layout : Except[_Rule | _RuleDelayed], opts : OptionsPattern[{MultiviewGraphics3D, Graphics3D}]] :=
   Module[{input = normalizeInput[g], matrix},
-   matrix = layoutMatrix[layout, OptionValue[MultiviewGraphics3D, {opts}, "ProjectionConvention"]];
+   matrix = layoutMatrix[layout, ownOption[{opts}, "ProjectionConvention"]];
    Which[
     FailureQ[input], issueFailure[input],
     FailureQ[matrix], issueFailure[matrix],
-    OptionValue[MultiviewGraphics3D, {opts}, "CameraInteraction"] === None, staticFigure[input, matrix, {opts}],
-    OptionValue[MultiviewGraphics3D, {opts}, "CameraInteraction"] === "RigLocked", rigLockedFigure[input, matrix, {opts}],
+    ownOption[{opts}, "CameraInteraction"] === None, staticFigure[input, matrix, {opts}],
+    ownOption[{opts}, "CameraInteraction"] === "RigLocked", rigLockedFigure[input, matrix, {opts}],
     True, axisLockedFigure[input, matrix, {opts}]]];
 
 End[];
